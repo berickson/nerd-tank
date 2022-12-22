@@ -3,3 +3,11 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+src/passwords.h
+node_modules
+client/*.csv
+package.json
+package-lock.json
+secrets.js
+TC66/*
+*checkpoint.ipynb
