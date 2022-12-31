@@ -20,8 +20,12 @@
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
 
+#include "battery.h"
+
 WiFiClientSecure wifi_client;
 PubSubClient mqtt_client(wifi_client);
+
+Battery battery;
 
 
 void setup_wifi() {
@@ -104,15 +108,20 @@ void maintain_mqtt_connection() {
 
 }
 
+String device_id;
+
 void setup() {
   Wire.begin(pin_oled_sda,pin_oled_scl);
   Serial.begin(921600);
   delay(5000); // wait for serial monitor
+  device_id = String(ESP.getEfuseMac(), HEX);
+  Serial.println("device_id: "+ device_id);
   Serial.println("Initializing display");
   
   init_display();
-  Serial.println("End of setup");
-  scan_i2c_addresses();
+  battery.init();
+
+  // scan_i2c_addresses();
   pinMode(26, INPUT_PULLUP);
   temperature_probe.begin();
   pinMode(26, INPUT_PULLUP);
@@ -120,6 +129,7 @@ void setup() {
   setup_wifi();
   mqtt_client.setServer(mqtt_server_address, 8883);
   maintain_mqtt_connection();
+  Serial.println("End of setup");
 }
 
 
@@ -172,7 +182,7 @@ void publish_mqtt_value(const char * topic, float x) {
 }
 
 void loop() {
-  return;
+  // return;
   static unsigned long loop_ms = 0;
   static unsigned long last_loop_ms = 0;
   static int64_t loop_count = 0;
@@ -202,10 +212,23 @@ void loop() {
     temperature_probe.requestTemperatures(); // Send the command to get temperatures
   }
 
+  // read battery
+  if(every_n_ms(last_loop_ms, loop_ms, 1000)) {
+      battery.read_millivolts();
+      // send to hivemq cloud
+      maintain_mqtt_connection();
+      if(mqtt_client.connected()) {
+        String topic = device_id+"/battery_volts";
+        publish_mqtt_value(topic.c_str(), battery.millivolts/1000.0);
+      }
+  }
+
 
   if(every_n_ms(last_loop_ms, loop_ms, 1000)) {
     float temp_f_0 = temperature_probe.getTempFByIndex(0);
+    if (temp_f_0 < -100) temp_f_0 = NAN;
     float temp_f_1 = temperature_probe.getTempFByIndex(1);
+    if (temp_f_1 < -100) temp_f_1 = NAN;
     probe_0_statistics.add_reading(temp_f_0);
     probe_1_statistics.add_reading(temp_f_1);
     if(probe_0_statistics.count >= 5) {
@@ -215,7 +238,8 @@ void loop() {
       // send to hivemq cloud
       maintain_mqtt_connection();
       if(mqtt_client.connected()) {
-        publish_mqtt_value("esp32/temp_0", mean_temp_f_0);
+        String topic = device_id+"/temp_0";
+        publish_mqtt_value(topic.c_str(), mean_temp_f_0);
       }
 
     }
@@ -224,27 +248,40 @@ void loop() {
       probe_1_statistics.reset();
       maintain_mqtt_connection();
       if(mqtt_client.connected()) {
-        publish_mqtt_value("esp32/temp_1", mean_temp_f_1);
+        String topic = device_id+"/temp_1";
+        publish_mqtt_value(topic.c_str(), mean_temp_f_1);
       }
     }
     
     display.clear();
+    battery.draw_battery(display);
     char buff[80];
-    sprintf(buff, "loop_count - %d", loop_count);
+    display.setFont(ArialMT_Plain_24);
+    if(isnan(mean_temp_f_0)) {
+      sprintf(buff, "--");
+    }
+    else {
+      sprintf(buff, "%.1f", mean_temp_f_0);
+    }
+
     display.drawString(0, 0, buff);
-    sprintf(buff, "latest F: %.1f %.1f", temp_f_0, temp_f_1);
-    display.drawString(0, 10, buff);
-    sprintf(buff, "smooth F: %.1f %.1f", mean_temp_f_0, mean_temp_f_1);
-    display.drawString(0, 20, buff);
+    if(isnan(mean_temp_f_1)) {
+      sprintf(buff, "--");
+    }
+    else {
+      sprintf(buff, "%.1f", mean_temp_f_1);
+    }
+    display.drawString(0, 24, buff);
     float graph_min = 65;
     float graph_max = 85;
     const int oled_width = 128;
     const int oled_height = 64;
-    display.drawRect(0,34, oled_width * (temp_f_0 - graph_min) / (graph_max-graph_min),1);
-    display.drawRect(0,33, oled_width * (mean_temp_f_0 - graph_min) / (graph_max-graph_min),3);
+    const int graph_y = 52;
+    display.drawRect(0,graph_y + 1, oled_width * (temp_f_0 - graph_min) / (graph_max-graph_min),1);
+    display.drawRect(0,graph_y, oled_width * (mean_temp_f_0 - graph_min) / (graph_max-graph_min),3);
 
-    display.drawRect(0,39, oled_width * (temp_f_1 - graph_min) / (graph_max-graph_min),1);
-    display.drawRect(0,38, oled_width * (mean_temp_f_1 - graph_min) / (graph_max-graph_min),3);
+    display.drawRect(0, graph_y+6, oled_width * (temp_f_1 - graph_min) / (graph_max-graph_min),1);
+    display.drawRect(0, graph_y+5, oled_width * (mean_temp_f_1 - graph_min) / (graph_max-graph_min),3);
 
     display.display();
   }
