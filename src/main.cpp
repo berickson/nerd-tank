@@ -2,6 +2,7 @@
 
 // targets Helteck Wifi Kit 32 V3 
 // https://heltec.org/project/wifi-kit-32-v3/
+// Schematic: https://resource.heltec.cn/download/WiFi_Kit_32_V3/HTIT-WB32_V3_Schematic_Diagram.pdf
 
 
 // for the OLED Display
@@ -50,6 +51,10 @@ void setup_wifi() {
   wifi_client.setCACert(root_ca);
 }
 
+
+// user input button
+const int pin_user_button = 0;
+
 // oled display
 const int oled_address=0x3c;
 const int pin_oled_sda = 17;
@@ -64,7 +69,6 @@ DallasTemperature temperature_probe(&one_wire);
 SSD1306Wire display(oled_address, pin_oled_sda, pin_oled_scl);
 
 void init_display() {
-  MAIN_ESP32_HAL_GPIO_H_
   // prepare oled display
   pinMode(pin_oled_rst, OUTPUT);
   digitalWrite(pin_oled_rst, LOW);
@@ -109,28 +113,6 @@ void maintain_mqtt_connection() {
 }
 
 String device_id;
-
-void setup() {
-  Wire.begin(pin_oled_sda,pin_oled_scl);
-  Serial.begin(921600);
-  delay(5000); // wait for serial monitor
-  device_id = String(ESP.getEfuseMac(), HEX);
-  Serial.println("device_id: "+ device_id);
-  Serial.println("Initializing display");
-  
-  init_display();
-  battery.init();
-
-  // scan_i2c_addresses();
-  pinMode(26, INPUT_PULLUP);
-  temperature_probe.begin();
-  pinMode(26, INPUT_PULLUP);
-  temperature_probe.setResolution(12);
-  setup_wifi();
-  mqtt_client.setServer(mqtt_server_address, 8883);
-  maintain_mqtt_connection();
-  Serial.println("End of setup");
-}
 
 
 bool every_n_ms(unsigned long last_loop_ms, unsigned long loop_ms, unsigned long ms) {
@@ -181,40 +163,111 @@ void publish_mqtt_value(const char * topic, float x) {
       }  
 }
 
+const uint32_t vbat_mv_plugged = 4050;
+const uint32_t vbat_mv_unplugged = 3999;
+const uint32_t loop_interval_ms = 1000;
+const uint32_t data_sample_interval_ms = 5 * 60 * 1000; // 5 minute sample time
+const uint32_t light_on_button_press_ms = 5*60*1000; // time to keep display on while on battery power
+
+struct LoopMonitor {
+  uint32_t loop_ms = 0;
+  uint32_t last_loop_ms = 0;
+  uint32_t loop_count = 0;
+  void begin_loop() {
+    last_loop_ms = loop_ms;
+    loop_ms = millis();
+    ++loop_count;
+  }
+  bool every_n_ms(uint32_t interval_ms) {
+    return ::every_n_ms(last_loop_ms, loop_ms, interval_ms);
+  }
+
+  uint32_t ms_elapsed_since_ms(uint32_t ms) {
+    return loop_ms - ms;
+  }
+
+};
+
+LoopMonitor loop_monitor;
+
+uint32_t last_user_button_press_millis = 0;
+bool user_requested_display_on = true;
+bool display_is_on = false;
+
+void user_button_pressed() {
+  user_requested_display_on = !display_is_on;
+  last_user_button_press_millis = loop_monitor.loop_ms;
+}
+
+void setup() {
+  Wire.begin(pin_oled_sda,pin_oled_scl);
+  Serial.begin(921600);
+  delay(5000); // wait for serial monitor
+  device_id = String(ESP.getEfuseMac(), HEX);
+  Serial.println("device_id: "+ device_id);
+  Serial.println("Initializing display");
+  
+  init_display();
+  battery.init();
+
+  // scan_i2c_addresses();
+  pinMode(26, INPUT_PULLUP);
+  temperature_probe.begin();
+  pinMode(26, INPUT_PULLUP);
+  temperature_probe.setResolution(12);
+  setup_wifi();
+  mqtt_client.setServer(mqtt_server_address, 8883);
+  maintain_mqtt_connection();
+
+  pinMode(pin_user_button, INPUT);
+  attachInterrupt(pin_user_button, user_button_pressed, FALLING);
+  Serial.println("End of setup");
+}
+
 void loop() {
-  // return;
-  static unsigned long loop_ms = 0;
-  static unsigned long last_loop_ms = 0;
-  static int64_t loop_count = 0;
   static Statistics probe_0_statistics;
   static Statistics probe_1_statistics;
-  last_loop_ms = loop_ms;
-  loop_ms = millis();
-  ++loop_count;
+  static float temp_f_0 = NAN;
+  static float temp_f_1 = NAN;
   static float mean_temp_f_0 = NAN;
   static float mean_temp_f_1 = NAN;
+  
 
-  // 170ma without delay -> 106ma (battery off)
-  // 80ma with delay 500ms
-  // 80ma with delay 10 ms
-  // 45 ma with esp_light_sleep_start 10ms
-  // 8ma with 45 ma spikes from siglent with esp_light_sleep
-  // 5ma with 45 ma spikes from siglent with esp_light_sleep and only displaying "."
-  const int delay_ms = 1000;
-  //vTaskDelay(delay_ms / portTICK_PERIOD_MS);
-  delay(100);
-  //esp_sleep_enable_timer_wakeup(delay_ms * 1000);
-  //esp_light_sleep_start();
+  loop_monitor.begin_loop();
+
+  battery.read_millivolts();
+  Serial.print("battery millivolts: "); Serial.println(battery.millivolts);
+
+  bool force_display_on = user_requested_display_on && loop_monitor.ms_elapsed_since_ms(last_user_button_press_millis)<light_on_button_press_ms;
+
+  Serial.print("user_requested_display_on:");
+  Serial.println(user_requested_display_on);
+
+  
+  if (display_is_on) {
+    // turn off display if unplugged and no user requeste
+    if ( user_requested_display_on == false 
+         || (battery.millivolts <= vbat_mv_unplugged && !force_display_on)) {
+      display_is_on = false;
+      display.displayOff();
+    }
+  } else  {
+    // turn on display if plugged in or user requested
+    if( (user_requested_display_on && battery.millivolts >= vbat_mv_plugged) || force_display_on) {
+      init_display();
+      display_is_on = true;
+      display.displayOn();
+    }
+  }
 
   // get temperature
-  if(every_n_ms(last_loop_ms, loop_ms, 1000)) {
+  if(loop_monitor.every_n_ms(1000)) {
     temperature_probe.setWaitForConversion(false);
     temperature_probe.requestTemperatures(); // Send the command to get temperatures
   }
 
-  // read battery
-  if(every_n_ms(last_loop_ms, loop_ms, 1000)) {
-      battery.read_millivolts();
+
+  if(loop_monitor.every_n_ms(1000)) {
       // send to hivemq cloud
       maintain_mqtt_connection();
       if(mqtt_client.connected()) {
@@ -223,11 +276,10 @@ void loop() {
       }
   }
 
-
-  if(every_n_ms(last_loop_ms, loop_ms, 1000)) {
-    float temp_f_0 = temperature_probe.getTempFByIndex(0);
+  if(loop_monitor.every_n_ms(1000)) {
+    temp_f_0 = temperature_probe.getTempFByIndex(0);
     if (temp_f_0 < -100) temp_f_0 = NAN;
-    float temp_f_1 = temperature_probe.getTempFByIndex(1);
+    temp_f_1 = temperature_probe.getTempFByIndex(1);
     if (temp_f_1 < -100) temp_f_1 = NAN;
     probe_0_statistics.add_reading(temp_f_0);
     probe_1_statistics.add_reading(temp_f_1);
@@ -252,7 +304,9 @@ void loop() {
         publish_mqtt_value(topic.c_str(), mean_temp_f_1);
       }
     }
+  }
     
+  if(display_is_on) {
     display.clear();
     battery.draw_battery(display);
     char buff[80];
@@ -286,38 +340,8 @@ void loop() {
     display.display();
   }
 
+  const int delay_ms = 1;
+  vTaskDelay(delay_ms / portTICK_PERIOD_MS);
 
-
-  if(every_n_ms(last_loop_ms, loop_ms, 10000)) {
-
-    Serial.print("Loops: ");
-    Serial.print(loop_count);
-
-    auto temp_probe_count = temperature_probe.getDS18Count();
-    Serial.print(" df18 count: " );
-    Serial.print(temp_probe_count);
-
-    Serial.print(" temp_f: ");
-
-    for(auto i=0;i<temp_probe_count; ++i) {
-      Serial.print(" ");
-      Serial.print(temperature_probe.getTempFByIndex(i));
-    }
-
-
-    Serial.print(" addresses: ");
-    for(auto i=0;i<temp_probe_count; ++i) {
-      DeviceAddress address = {0,0,0,0,0,0,0,0};
-      if(temperature_probe.getAddress(address,i)) {
-        Serial.print(" ");
-        for(auto j=0; j<8; ++j) {
-          Serial.print(address[j],HEX);
-        }
-      }
-    }
-
-    Serial.println();
-
-  }
   
 }
