@@ -15,10 +15,11 @@ client.subscribe("#")
 client.on('connect', () => console.log("connected"));
 client.on("message", function(topic,payload) {
     filename = topic.replace("/","-") + ".csv";
+    filepath = "data/"+filename;
     let d = new Date();
     let log_string = [topic, d.toISOString(), payload.toString()].join(",")
     console.log(log_string);
-    fs.appendFile(filename,log_string+"\n", function (err) {
+    fs.appendFile(filepath,log_string+"\n", function (err) {
         if (err) throw err;
       });
       
