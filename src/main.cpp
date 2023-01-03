@@ -1,4 +1,11 @@
 #include <Arduino.h>
+#include <chrono>
+
+int64_t get_system_millis() {
+  auto duration = std::chrono::system_clock::now().time_since_epoch();
+  auto chrono_millis = std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
+  return chrono_millis;
+}
 
 // targets Helteck Wifi Kit 32 V3 
 // https://heltec.org/project/wifi-kit-32-v3/
@@ -60,6 +67,9 @@ const int oled_address=0x3c;
 const int pin_oled_sda = 17;
 const int pin_oled_scl = 18;
 const int pin_oled_rst = 21;
+
+// board LED
+const int pin_led = 35;
 
 // temperature sensor pin
 const int pin_one_wire_bus = 26;
@@ -167,15 +177,29 @@ const uint32_t vbat_mv_plugged = 4050;
 const uint32_t vbat_mv_unplugged = 3999;
 const uint32_t loop_interval_ms = 1000;
 const uint32_t data_sample_interval_ms = 5 * 60 * 1000; // 5 minute sample time
-const uint32_t light_on_button_press_ms = 5*60*1000; // time to keep display on while on battery power
+const uint32_t light_on_button_press_ms = 60*1000; // time to keep display on while on battery power
 
 struct LoopMonitor {
   uint32_t loop_ms = 0;
   uint32_t last_loop_ms = 0;
   uint32_t loop_count = 0;
+  uint32_t pre_sleep_ms = 0;
+
+  // init should be called on first power on if using RTC memory
+  void init() {
+    loop_ms = 0;
+    last_loop_ms = 0;
+    loop_count = 0;
+    pre_sleep_ms = 0;
+  }
+
   void begin_loop() {
     last_loop_ms = loop_ms;
-    loop_ms = millis();
+
+    
+    
+    loop_ms = get_system_millis();
+    // loop_ms = millis() + pre_sleep_ms;
     ++loop_count;
   }
   bool every_n_ms(uint32_t interval_ms) {
@@ -186,28 +210,61 @@ struct LoopMonitor {
     return loop_ms - ms;
   }
 
+  void prep_for_sleep(uint32_t sleep_ms) {
+    // pre_sleep_ms = loop_ms + sleep_ms;
+
+  }
 };
 
-LoopMonitor loop_monitor;
+RTC_NOINIT_ATTR LoopMonitor loop_monitor;
 
-uint32_t last_user_button_press_millis = 0;
-bool user_requested_display_on = true;
+RTC_NOINIT_ATTR uint32_t last_user_button_press_millis = 0;
+RTC_NOINIT_ATTR bool user_requested_display_on = true;
 bool display_is_on = false;
 
 void user_button_pressed() {
-  user_requested_display_on = !display_is_on;
-  last_user_button_press_millis = loop_monitor.loop_ms;
+
+  // "debounce", don't allow more than once per second.
+  if(loop_monitor.loop_ms - last_user_button_press_millis < 1000) {
+    return;
+  }
+
+  if(digitalRead(pin_user_button) == LOW) {
+    user_requested_display_on = !display_is_on;
+    last_user_button_press_millis = loop_monitor.loop_ms;
+  }
 }
 
 void setup() {
   Wire.begin(pin_oled_sda,pin_oled_scl);
   Serial.begin(921600);
-  delay(5000); // wait for serial monitor
+  display_is_on = false;
+
+  switch(esp_sleep_get_wakeup_cause()) {
+    case ESP_SLEEP_WAKEUP_EXT0:
+      user_requested_display_on = true;
+      // pinMode(pin_led, OUTPUT);
+      // digitalWrite(pin_led, HIGH);
+      break;
+
+    case ESP_SLEEP_WAKEUP_TIMER:
+      break;
+
+    case ESP_SLEEP_WAKEUP_UNDEFINED:
+    default:
+      loop_monitor.init();
+      user_requested_display_on = true;
+      break;
+  }
+  last_user_button_press_millis = get_system_millis();
+
+
+  //delay(5000); // wait for serial monitor
   device_id = String(ESP.getEfuseMac(), HEX);
   Serial.println("device_id: "+ device_id);
   Serial.println("Initializing display");
   
-  init_display();
+  // init_display();
   battery.init();
 
   // scan_i2c_addresses();
@@ -215,14 +272,14 @@ void setup() {
   temperature_probe.begin();
   pinMode(26, INPUT_PULLUP);
   temperature_probe.setResolution(12);
-  setup_wifi();
-  mqtt_client.setServer(mqtt_server_address, 8883);
-  maintain_mqtt_connection();
+  // setup_wifi();
 
   pinMode(pin_user_button, INPUT);
   attachInterrupt(pin_user_button, user_button_pressed, FALLING);
   Serial.println("End of setup");
 }
+
+
 
 void loop() {
   static Statistics probe_0_statistics;
@@ -234,29 +291,48 @@ void loop() {
   
 
   loop_monitor.begin_loop();
+  Serial.print("loop millis: ");
+  Serial.println(loop_monitor.loop_ms);
 
   battery.read_millivolts();
   Serial.print("battery millivolts: "); Serial.println(battery.millivolts);
 
-  bool force_display_on = user_requested_display_on && loop_monitor.ms_elapsed_since_ms(last_user_button_press_millis)<light_on_button_press_ms;
+  bool force_display_on = user_requested_display_on && (loop_monitor.loop_ms - last_user_button_press_millis  <light_on_button_press_ms);
+
 
   Serial.print("user_requested_display_on:");
-  Serial.println(user_requested_display_on);
+  Serial.print(user_requested_display_on);
+  Serial.print(", ");
+  Serial.println(last_user_button_press_millis);
 
   
   if (display_is_on) {
     // turn off display if unplugged and no user requeste
     if ( user_requested_display_on == false 
-         || (battery.millivolts <= vbat_mv_unplugged && !force_display_on)) {
+         || ( (battery.millivolts <= vbat_mv_unplugged) && !force_display_on)) {
+      // display.clear();
+      // display.setFont(ArialMT_Plain_10);
+      // display.drawString(0,0,"turning off the display");
+      // display.drawString(0,10,(String("user_req:")+String(user_requested_display_on).c_str()));
+      // display.drawString(0,20,(String("force_on:")+String(force_display_on).c_str()));
+      // display.drawString(0,30,(String("user_millis:")+String(last_user_button_press_millis).c_str()));
+      // display.drawString(0,40,(String("loop_millis:")+String(loop_monitor.loop_ms).c_str()));
+      // display.display();
+      // delay(10000);
+
       display_is_on = false;
       display.displayOff();
     }
   } else  {
     // turn on display if plugged in or user requested
-    if( (user_requested_display_on && battery.millivolts >= vbat_mv_plugged) || force_display_on) {
+      if (user_requested_display_on) {
+    // if( (user_requested_display_on && (battery.millivolts >= vbat_mv_plugged)) || force_display_on) {
       init_display();
       display_is_on = true;
       display.displayOn();
+      // display.drawString(0,0,"turning on the display");
+      // display.display();
+      // delay(2000);
     }
   }
 
@@ -266,46 +342,11 @@ void loop() {
     temperature_probe.requestTemperatures(); // Send the command to get temperatures
   }
 
-
-  if(loop_monitor.every_n_ms(1000)) {
-      // send to hivemq cloud
-      maintain_mqtt_connection();
-      if(mqtt_client.connected()) {
-        String topic = device_id+"/battery_volts";
-        publish_mqtt_value(topic.c_str(), battery.millivolts/1000.0);
-      }
+  if(loop_monitor.every_n_ms(5000)) {
+    Serial.println("***5 seconds elapsed");
   }
 
-  if(loop_monitor.every_n_ms(1000)) {
-    temp_f_0 = temperature_probe.getTempFByIndex(0);
-    if (temp_f_0 < -100) temp_f_0 = NAN;
-    temp_f_1 = temperature_probe.getTempFByIndex(1);
-    if (temp_f_1 < -100) temp_f_1 = NAN;
-    probe_0_statistics.add_reading(temp_f_0);
-    probe_1_statistics.add_reading(temp_f_1);
-    if(probe_0_statistics.count >= 5) {
-      mean_temp_f_0 = probe_0_statistics.mean();
-      probe_0_statistics.reset();
 
-      // send to hivemq cloud
-      maintain_mqtt_connection();
-      if(mqtt_client.connected()) {
-        String topic = device_id+"/temp_0";
-        publish_mqtt_value(topic.c_str(), mean_temp_f_0);
-      }
-
-    }
-    if(probe_1_statistics.count >= 5) {
-      mean_temp_f_1 = probe_1_statistics.mean();
-      probe_1_statistics.reset();
-      maintain_mqtt_connection();
-      if(mqtt_client.connected()) {
-        String topic = device_id+"/temp_1";
-        publish_mqtt_value(topic.c_str(), mean_temp_f_1);
-      }
-    }
-  }
-    
   if(display_is_on) {
     display.clear();
     battery.draw_battery(display);
@@ -340,8 +381,65 @@ void loop() {
     display.display();
   }
 
-  const int delay_ms = 1;
+
+  if(loop_monitor.every_n_ms(30 * 1000)) {
+      if(WiFi.status() != WL_CONNECTED) {
+        setup_wifi();
+      }
+      mqtt_client.setServer(mqtt_server_address, 8883);
+      // send to hivemq cloud
+      maintain_mqtt_connection();
+      if(mqtt_client.connected()) {
+        String topic = device_id+"/battery_volts";
+        publish_mqtt_value(topic.c_str(), battery.millivolts/1000.0);
+      }
+    temp_f_0 = temperature_probe.getTempFByIndex(0);
+    if (temp_f_0 < -100) temp_f_0 = NAN;
+    temp_f_1 = temperature_probe.getTempFByIndex(1);
+    if (temp_f_1 < -100) temp_f_1 = NAN;
+    probe_0_statistics.add_reading(temp_f_0);
+    probe_1_statistics.add_reading(temp_f_1);
+    if(probe_0_statistics.count >= 5) {
+      mean_temp_f_0 = probe_0_statistics.mean();
+      probe_0_statistics.reset();
+
+      // send to hivemq cloud
+      maintain_mqtt_connection();
+      if(mqtt_client.connected()) {
+        String topic = device_id+"/temp_0";
+        publish_mqtt_value(topic.c_str(), mean_temp_f_0);
+      }
+
+    }
+    if(probe_1_statistics.count >= 5) {
+      mean_temp_f_1 = probe_1_statistics.mean();
+      probe_1_statistics.reset();
+      maintain_mqtt_connection();
+      if(mqtt_client.connected()) {
+        String topic = device_id+"/temp_1";
+        publish_mqtt_value(topic.c_str(), mean_temp_f_1);
+      }
+    }
+  }
+    
+
+  const int delay_ms = 1000;
   vTaskDelay(delay_ms / portTICK_PERIOD_MS);
+
+  const uint32_t one_second_in_microseconds = 1E6;
+  const uint32_t sleep_seconds = 10;
+  
+  if(!force_display_on && !display_is_on && digitalRead(pin_user_button)==HIGH) {
+    if(battery.millivolts < vbat_mv_plugged ) {
+      uint32_t sleep_ms = sleep_seconds * 1000;
+      loop_monitor.prep_for_sleep(sleep_ms);
+      detachInterrupt(pin_user_button);
+      esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, LOW);
+      esp_deep_sleep(sleep_seconds * one_second_in_microseconds);
+    }
+  }
+
+  
 
   
 }
