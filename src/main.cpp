@@ -427,7 +427,7 @@ void loop() {
       esp_light_sleep_start();
     } else {
       const int delay_ms = 1000;
-                                     vTaskDelay(delay_ms / portTICK_PERIOD_MS);
+      vTaskDelay(delay_ms / portTICK_PERIOD_MS);
     }
   }
  
