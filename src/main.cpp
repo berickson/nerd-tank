@@ -37,7 +37,6 @@ Battery battery;
 
 
 void setup_wifi() {
-  delay(10);
   // We start by connecting to a WiFi network
   Serial.println();
   Serial.print("Connecting to ");
@@ -46,7 +45,7 @@ void setup_wifi() {
   WiFi.begin(wifi_ssid, wifi_password);
 
   while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
+    vTaskDelay(100/portTICK_PERIOD_MS);
     Serial.print(".");
   }
 
@@ -135,8 +134,6 @@ class Statistics {
       float sum_x = 0.0;
       float sum_x2 = 0.0;
 
-
-
     void reset() {
       count = 0;
       sum_x = 0.0;
@@ -180,26 +177,22 @@ const uint32_t data_sample_interval_ms = 5 * 60 * 1000; // 5 minute sample time
 const uint32_t light_on_button_press_ms = 60*1000; // time to keep display on while on battery power
 
 struct LoopMonitor {
-  uint32_t loop_ms = 0;
-  uint32_t last_loop_ms = 0;
-  uint32_t loop_count = 0;
-  uint32_t pre_sleep_ms = 0;
+  uint64_t loop_ms = 0;
+  uint64_t last_loop_ms = 0;
+  uint64_t loop_count = 0;
+
 
   // init should be called on first power on if using RTC memory
   void init() {
     loop_ms = 0;
     last_loop_ms = 0;
     loop_count = 0;
-    pre_sleep_ms = 0;
   }
 
   void begin_loop() {
     last_loop_ms = loop_ms;
-
-    
     
     loop_ms = get_system_millis();
-    // loop_ms = millis() + pre_sleep_ms;
     ++loop_count;
   }
   bool every_n_ms(uint32_t interval_ms) {
@@ -209,18 +202,13 @@ struct LoopMonitor {
   uint32_t ms_elapsed_since_ms(uint32_t ms) {
     return loop_ms - ms;
   }
-
-  void prep_for_sleep(uint32_t sleep_ms) {
-    // pre_sleep_ms = loop_ms + sleep_ms;
-
-  }
 };
 
 RTC_NOINIT_ATTR LoopMonitor loop_monitor;
-
 RTC_NOINIT_ATTR uint32_t last_user_button_press_millis = 0;
 RTC_NOINIT_ATTR bool user_requested_display_on = true;
 bool display_is_on = false;
+TaskHandle_t wifi_task_handle = nullptr;
 
 void user_button_pressed() {
 
@@ -259,12 +247,9 @@ void setup() {
   last_user_button_press_millis = get_system_millis();
 
 
-  //delay(5000); // wait for serial monitor
   device_id = String(ESP.getEfuseMac(), HEX);
   Serial.println("device_id: "+ device_id);
-  Serial.println("Initializing display");
   
-  // init_display();
   battery.init();
 
   // scan_i2c_addresses();
@@ -272,11 +257,47 @@ void setup() {
   temperature_probe.begin();
   pinMode(26, INPUT_PULLUP);
   temperature_probe.setResolution(12);
-  // setup_wifi();
 
   pinMode(pin_user_button, INPUT);
   attachInterrupt(pin_user_button, user_button_pressed, FALLING);
   Serial.println("End of setup");
+}
+
+
+
+void upload_data_to_server() {
+      if(WiFi.status() != WL_CONNECTED) {
+        setup_wifi();
+      }
+      mqtt_client.setServer(mqtt_server_address, 8883);
+      // send to hivemq cloud
+      maintain_mqtt_connection();
+      if(mqtt_client.connected()) {
+        String topic = device_id+"/battery_volts";
+        publish_mqtt_value(topic.c_str(), battery.millivolts/1000.0);
+
+        topic = device_id+"/temp_0";
+        float temp_f_0 = temperature_probe.getTempFByIndex(0);
+        if (temp_f_0 < -100) temp_f_0 = NAN;
+        publish_mqtt_value(topic.c_str(), temp_f_0);
+
+        topic = device_id+"/temp_1";
+        float temp_f_1 = temperature_probe.getTempFByIndex(1);
+        if (temp_f_1 < -100) temp_f_1 = NAN;
+        publish_mqtt_value(topic.c_str(), temp_f_1);
+
+      }
+}
+
+void wifi_task(void * params) {
+  Serial.print("wifi_task: Executing on core ");
+  Serial.println(xPortGetCoreID());
+
+  upload_data_to_server();
+
+  Serial.println("wifi_task done ");
+  wifi_task_handle = nullptr; 
+  vTaskDelete(NULL); // delete this task
 }
 
 
@@ -288,64 +309,37 @@ void loop() {
   static float temp_f_1 = NAN;
   static float mean_temp_f_0 = NAN;
   static float mean_temp_f_1 = NAN;
+  static uint64_t wifi_start_ms = 0;
   
 
   loop_monitor.begin_loop();
-  Serial.print("loop millis: ");
-  Serial.println(loop_monitor.loop_ms);
-
   battery.read_millivolts();
-  Serial.print("battery millivolts: "); Serial.println(battery.millivolts);
+  Serial.printf("loop ms: %ju battery mv: %d\n", loop_monitor.loop_ms, battery.millivolts);
 
   bool force_display_on = user_requested_display_on && (loop_monitor.loop_ms - last_user_button_press_millis  <light_on_button_press_ms);
-
-
-  Serial.print("user_requested_display_on:");
-  Serial.print(user_requested_display_on);
-  Serial.print(", ");
-  Serial.println(last_user_button_press_millis);
 
   
   if (display_is_on) {
     // turn off display if unplugged and no user requeste
     if ( user_requested_display_on == false 
          || ( (battery.millivolts <= vbat_mv_unplugged) && !force_display_on)) {
-      // display.clear();
-      // display.setFont(ArialMT_Plain_10);
-      // display.drawString(0,0,"turning off the display");
-      // display.drawString(0,10,(String("user_req:")+String(user_requested_display_on).c_str()));
-      // display.drawString(0,20,(String("force_on:")+String(force_display_on).c_str()));
-      // display.drawString(0,30,(String("user_millis:")+String(last_user_button_press_millis).c_str()));
-      // display.drawString(0,40,(String("loop_millis:")+String(loop_monitor.loop_ms).c_str()));
-      // display.display();
-      // delay(10000);
-
       display_is_on = false;
       display.displayOff();
     }
   } else  {
     // turn on display if plugged in or user requested
       if (user_requested_display_on) {
-    // if( (user_requested_display_on && (battery.millivolts >= vbat_mv_plugged)) || force_display_on) {
       init_display();
       display_is_on = true;
       display.displayOn();
-      // display.drawString(0,0,"turning on the display");
-      // display.display();
-      // delay(2000);
     }
   }
 
   // get temperature
   if(loop_monitor.every_n_ms(1000)) {
-    temperature_probe.setWaitForConversion(false);
+    temperature_probe.setWaitForConversion(true);
     temperature_probe.requestTemperatures(); // Send the command to get temperatures
   }
-
-  if(loop_monitor.every_n_ms(5000)) {
-    Serial.println("***5 seconds elapsed");
-  }
-
 
   if(display_is_on) {
     display.clear();
@@ -381,65 +375,60 @@ void loop() {
     display.display();
   }
 
+  // kill wifi task if it runs too long
+  int64_t wifi_timeout_ms = 20000;
+  if(wifi_task_handle != nullptr && loop_monitor.loop_ms - wifi_start_ms > wifi_timeout_ms) {
+    vTaskDelete(wifi_task_handle);
+    wifi_task_handle = nullptr;
+    Serial.println("WiFi task timed out and was killed");
 
-  if(loop_monitor.every_n_ms(30 * 1000)) {
-      if(WiFi.status() != WL_CONNECTED) {
-        setup_wifi();
-      }
-      mqtt_client.setServer(mqtt_server_address, 8883);
-      // send to hivemq cloud
-      maintain_mqtt_connection();
-      if(mqtt_client.connected()) {
-        String topic = device_id+"/battery_volts";
-        publish_mqtt_value(topic.c_str(), battery.millivolts/1000.0);
-      }
-    temp_f_0 = temperature_probe.getTempFByIndex(0);
-    if (temp_f_0 < -100) temp_f_0 = NAN;
-    temp_f_1 = temperature_probe.getTempFByIndex(1);
-    if (temp_f_1 < -100) temp_f_1 = NAN;
-    probe_0_statistics.add_reading(temp_f_0);
-    probe_1_statistics.add_reading(temp_f_1);
-    if(probe_0_statistics.count >= 5) {
-      mean_temp_f_0 = probe_0_statistics.mean();
-      probe_0_statistics.reset();
-
-      // send to hivemq cloud
-      maintain_mqtt_connection();
-      if(mqtt_client.connected()) {
-        String topic = device_id+"/temp_0";
-        publish_mqtt_value(topic.c_str(), mean_temp_f_0);
-      }
-
-    }
-    if(probe_1_statistics.count >= 5) {
-      mean_temp_f_1 = probe_1_statistics.mean();
-      probe_1_statistics.reset();
-      maintain_mqtt_connection();
-      if(mqtt_client.connected()) {
-        String topic = device_id+"/temp_1";
-        publish_mqtt_value(topic.c_str(), mean_temp_f_1);
-      }
-    }
   }
-    
 
-  const int delay_ms = 1000;
-  vTaskDelay(delay_ms / portTICK_PERIOD_MS);
+  if(loop_monitor.every_n_ms(5 * 60 * 1000)) {
+    const char * task_name = "wifi_task";
+    const uint32_t stack_depth = 10000; // 1000 caused stack overflow
+    void * parameters = nullptr;
+    u32_t priority = 1; // lower numbers are lower priority
+    BaseType_t core_id = 0;
 
-  const uint32_t one_second_in_microseconds = 1E6;
-  const uint32_t sleep_seconds = 10;
-  
-  if(!force_display_on && !display_is_on && digitalRead(pin_user_button)==HIGH) {
-    if(battery.millivolts < vbat_mv_plugged ) {
-      uint32_t sleep_ms = sleep_seconds * 1000;
-      loop_monitor.prep_for_sleep(sleep_ms);
+    auto rv = xTaskCreatePinnedToCore(
+      wifi_task,
+      task_name,
+      stack_depth,
+      parameters,
+      priority,
+      &wifi_task_handle,
+      core_id);
+    if(rv==pdPASS) {
+      Serial.println("wifi task created ok");
+    } else {
+      Serial.print("wifi task create failed with code ");
+      Serial.print(rv);
+    }
+    wifi_start_ms = loop_monitor.loop_ms;
+  }
+ 
+  // sleep or delay depending on what is going on
+  bool can_light_sleep = (wifi_task_handle == nullptr)
+                          && digitalRead(pin_user_button)==HIGH;
+  bool can_deep_sleep =  can_light_sleep  
+                         && !display_is_on;
+  if(can_deep_sleep) {
+      const uint32_t one_second_in_microseconds = 1E6;
+      const uint32_t sleep_seconds = 10;
+
       detachInterrupt(pin_user_button);
       esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, LOW);
       esp_deep_sleep(sleep_seconds * one_second_in_microseconds);
+  } else {
+    if(can_light_sleep) {
+      esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, LOW);
+      esp_sleep_enable_timer_wakeup(5 * 1000 * 1000);
+      esp_light_sleep_start();
+    } else {
+      const int delay_ms = 1000;
+                                     vTaskDelay(delay_ms / portTICK_PERIOD_MS);
     }
   }
-
-  
-
-  
+ 
 }
