@@ -124,7 +124,7 @@ void maintain_mqtt_connection() {
 String device_id;
 
 
-bool every_n_ms(unsigned long last_loop_ms, unsigned long loop_ms, unsigned long ms) {
+bool every_n_ms(int64_t last_loop_ms, int64_t loop_ms, int64_t ms) {
   return (last_loop_ms % ms) + (loop_ms - last_loop_ms) >= ms;
 }
 
@@ -174,7 +174,7 @@ const uint32_t vbat_mv_plugged = 4050;
 const uint32_t vbat_mv_unplugged = 3999;
 const uint32_t loop_interval_ms = 1000;
 const uint32_t data_sample_interval_ms = 5 * 60 * 1000; // 5 minute sample time
-const uint32_t light_on_button_press_ms = 60*1000; // time to keep display on while on battery power
+const uint32_t display_hold_ms = 60*1000; // time to keep display on while on battery power
 
 struct LoopMonitor {
   uint64_t loop_ms = 0;
@@ -195,31 +195,33 @@ struct LoopMonitor {
     loop_ms = get_system_millis();
     ++loop_count;
   }
-  bool every_n_ms(uint32_t interval_ms) {
+  bool every_n_ms(uint64_t interval_ms) {
     return ::every_n_ms(last_loop_ms, loop_ms, interval_ms);
   }
 
-  uint32_t ms_elapsed_since_ms(uint32_t ms) {
+  uint64_t ms_elapsed_since_ms(uint64_t ms) {
     return loop_ms - ms;
   }
 };
 
 RTC_NOINIT_ATTR LoopMonitor loop_monitor;
-RTC_NOINIT_ATTR uint32_t last_user_button_press_millis = 0;
+RTC_NOINIT_ATTR uint64_t display_request_millis = 0;
 RTC_NOINIT_ATTR bool user_requested_display_on = true;
 bool display_is_on = false;
 TaskHandle_t wifi_task_handle = nullptr;
 
 void user_button_pressed() {
 
+  auto ms = get_system_millis();
+
   // "debounce", don't allow more than once per second.
-  if(loop_monitor.loop_ms - last_user_button_press_millis < 1000) {
+  if(ms - display_request_millis < 1000) {
     return;
   }
 
   if(digitalRead(pin_user_button) == LOW) {
     user_requested_display_on = !display_is_on;
-    last_user_button_press_millis = loop_monitor.loop_ms;
+    display_request_millis = ms;
   }
 }
 
@@ -227,28 +229,31 @@ void setup() {
   Wire.begin(pin_oled_sda,pin_oled_scl);
   Serial.begin(921600);
   display_is_on = false;
+  Serial.println();
 
   switch(esp_sleep_get_wakeup_cause()) {
     case ESP_SLEEP_WAKEUP_EXT0:
       user_requested_display_on = true;
+      display_request_millis = get_system_millis();
+      Serial.println("waking from EXT0");
       // pinMode(pin_led, OUTPUT);
       // digitalWrite(pin_led, HIGH);
       break;
 
     case ESP_SLEEP_WAKEUP_TIMER:
+      Serial.println("waking from timer");
       break;
 
     case ESP_SLEEP_WAKEUP_UNDEFINED:
     default:
+      Serial.println("waking from undefined / other");
       loop_monitor.init();
       user_requested_display_on = true;
       break;
   }
-  last_user_button_press_millis = get_system_millis();
-
-
+  
   device_id = String(ESP.getEfuseMac(), HEX);
-  Serial.println("device_id: "+ device_id);
+  Serial.println("setup for device_id: "+ device_id);
   
   battery.init();
 
@@ -260,7 +265,6 @@ void setup() {
 
   pinMode(pin_user_button, INPUT);
   attachInterrupt(pin_user_button, user_button_pressed, FALLING);
-  Serial.println("End of setup");
 }
 
 
@@ -314,9 +318,18 @@ void loop() {
 
   loop_monitor.begin_loop();
   battery.read_millivolts();
-  Serial.printf("loop ms: %ju battery mv: %d\n", loop_monitor.loop_ms, battery.millivolts);
 
-  bool force_display_on = user_requested_display_on && (loop_monitor.loop_ms - last_user_button_press_millis  <light_on_button_press_ms);
+    // get temperature
+  if(loop_monitor.every_n_ms(1000)) {
+    temperature_probe.setWaitForConversion(true);
+    temperature_probe.requestTemperatures(); // Send the command to get temperatures
+  }
+
+  mean_temp_f_0 = temp_f_0 = temperature_probe.getTempFByIndex(0);
+  mean_temp_f_1 = temp_f_1 = temperature_probe.getTempFByIndex(1);
+  Serial.printf("loop ms: %ju battery mv: %d temps: %f, %f\n", loop_monitor.loop_ms, battery.millivolts, temp_f_0, temp_f_1);
+
+  bool force_display_on = user_requested_display_on && (loop_monitor.loop_ms - display_request_millis  <display_hold_ms);
 
   
   if (display_is_on) {
@@ -328,18 +341,13 @@ void loop() {
     }
   } else  {
     // turn on display if plugged in or user requested
-      if (user_requested_display_on) {
+      if (force_display_on) {
       init_display();
       display_is_on = true;
       display.displayOn();
     }
   }
 
-  // get temperature
-  if(loop_monitor.every_n_ms(1000)) {
-    temperature_probe.setWaitForConversion(true);
-    temperature_probe.requestTemperatures(); // Send the command to get temperatures
-  }
 
   if(display_is_on) {
     display.clear();
@@ -366,6 +374,7 @@ void loop() {
     const int oled_width = 128;
     const int oled_height = 64;
     const int graph_y = 52;
+
     display.drawRect(0,graph_y + 1, oled_width * (temp_f_0 - graph_min) / (graph_max-graph_min),1);
     display.drawRect(0,graph_y, oled_width * (mean_temp_f_0 - graph_min) / (graph_max-graph_min),3);
 
@@ -376,7 +385,7 @@ void loop() {
   }
 
   // kill wifi task if it runs too long
-  int64_t wifi_timeout_ms = 20000;
+  uint64_t wifi_timeout_ms = 20000;
   if(wifi_task_handle != nullptr && loop_monitor.loop_ms - wifi_start_ms > wifi_timeout_ms) {
     vTaskDelete(wifi_task_handle);
     wifi_task_handle = nullptr;
@@ -414,16 +423,16 @@ void loop() {
   bool can_deep_sleep =  can_light_sleep  
                          && !display_is_on;
   if(can_deep_sleep) {
-      const uint32_t one_second_in_microseconds = 1E6;
       const uint32_t sleep_seconds = 10;
 
       detachInterrupt(pin_user_button);
       esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, LOW);
-      esp_deep_sleep(sleep_seconds * one_second_in_microseconds);
+      esp_deep_sleep(sleep_seconds * 1E6);
   } else {
     if(can_light_sleep) {
+      const uint32_t light_sleep_seconds = 5;
       esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, LOW);
-      esp_sleep_enable_timer_wakeup(5 * 1000 * 1000);
+      esp_sleep_enable_timer_wakeup(light_sleep_seconds * 1000 * 1000);
       esp_light_sleep_start();
     } else {
       const int delay_ms = 1000;
