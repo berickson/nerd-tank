@@ -1,10 +1,26 @@
 #include <Arduino.h>
+
+
+
+#include <ArduinoJson.h>
 #include <chrono>
+
 
 int64_t get_system_millis() {
   auto duration = std::chrono::system_clock::now().time_since_epoch();
   auto chrono_millis = std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
   return chrono_millis;
+}
+
+void fill_iso_time_string(char * utc_with_ms) {
+  auto now = std::chrono::system_clock::now();
+  time_t tt = std::chrono::system_clock::to_time_t(now);
+
+  char utc[20];
+  strftime(utc, sizeof(utc), "%Y-%m-%dT%H:%M:%S", gmtime(&tt));
+  auto truncated = std::chrono::system_clock::from_time_t(tt);
+  int delta_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - truncated).count();
+  sprintf(utc_with_ms, "%s.%03dZ", utc, delta_ms);
 }
 
 // targets Helteck Wifi Kit 32 V3 
@@ -36,6 +52,20 @@ PubSubClient mqtt_client(wifi_client);
 Battery battery;
 
 
+void print_local_time()
+{
+  char buf[27];
+  fill_iso_time_string(buf);
+  Serial.println(buf);
+  return;
+  struct tm timeinfo;
+  if(!getLocalTime(&timeinfo)){
+    Serial.println("Failed to obtain time");
+    return;
+  }
+  Serial.println(&timeinfo, "%A, %B %d %Y %H:%M:%S");
+}
+
 void setup_wifi() {
   // We start by connecting to a WiFi network
   Serial.println();
@@ -47,6 +77,14 @@ void setup_wifi() {
   while (WiFi.status() != WL_CONNECTED) {
     vTaskDelay(100/portTICK_PERIOD_MS);
     Serial.print(".");
+  }
+
+  // get network time
+  {
+    long gmt_offset_sec = 0;
+    long daylight_offset_sec = 0;
+    const char* ntp_server = "pool.ntp.org";
+    configTime(gmt_offset_sec, daylight_offset_sec, ntp_server);
   }
 
   Serial.println("");
@@ -88,6 +126,13 @@ void init_display() {
 }
 
 
+struct TelemetryReading {
+  char timestamp[25]; // exactly enought space for iso-time
+  double temp_0 = NAN;
+  double temp_1 = NAN;
+  uint16_t battery_millivolts = 0;
+};
+
 
 void scan_i2c_addresses(){
   Serial.println("\n Scanning I2C Addresses");
@@ -125,7 +170,7 @@ String device_id;
 
 
 bool every_n_ms(int64_t last_loop_ms, int64_t loop_ms, int64_t ms) {
-  return (last_loop_ms % ms) + (loop_ms - last_loop_ms) >= ms;
+  return last_loop_ms == 0 || (last_loop_ms % ms) + (loop_ms - last_loop_ms) >= ms;
 }
 
 class Statistics {
@@ -151,24 +196,59 @@ class Statistics {
     }
 };
 
-void publish_mqtt_value(const char * topic, float x) {
-      char value_string[8]; 
-      const int  digits_after_decimal = 2;
-      const int min_width = 1;
-      dtostrf(x, min_width, digits_after_decimal, value_string);
 
-      if(mqtt_client.publish(topic, value_string)) {
-        Serial.print("succesfully sent ");
-        Serial.print(value_string);
-        Serial.print(" to ");
-        Serial.print(topic);
-        Serial.println();
+template  <uint32_t n, uint32_t item_size> class FixedQueue {
+public:
+  byte array[n][item_size];
+  int front;
+  int rear;
+  void init() {
+    front = -1;
+    rear = -1;
+  }
+
+  // returns true on success
+  bool enqueue(void * item) {
+      if ((front == 0 && rear == n-1) || (front == rear+1)) {
+          // overflow
+          return false;
+      }
+      if (front == -1) {
+          front = 0;
+          rear = 0;
       } else {
-        Serial.print("failed sending a message to ");
-        Serial.print(topic);
-        Serial.println();
-      }  
-}
+          rear = (rear == n - 1) ? 0 :  rear + 1;
+      }
+      memcpy(array[rear], item, item_size);
+      return true;
+  }
+
+  bool peek(void * item) {
+    if (front == -1) {
+      // underflow
+      return false;
+    }
+    memcpy(item, array[front],item_size);
+    return true;
+  }
+
+  bool dequeue(void * item) {
+    if (front == -1) {
+      // underflow
+      return false;
+    }
+    memcpy(item, array[front],item_size);
+
+    if (front == rear) {
+      front = -1;
+      rear = -1;
+    } else {
+      front = (front == n - 1) ? 0: front + 1;
+    }
+  return true;
+  }
+};
+
 
 const uint32_t vbat_mv_plugged = 4050;
 const uint32_t vbat_mv_unplugged = 3999;
@@ -177,9 +257,9 @@ const uint32_t data_sample_interval_ms = 5 * 60 * 1000; // 5 minute sample time
 const uint32_t display_hold_ms = 60*1000; // time to keep display on while on battery power
 
 struct LoopMonitor {
-  uint64_t loop_ms = 0;
-  uint64_t last_loop_ms = 0;
-  uint64_t loop_count = 0;
+  uint64_t loop_ms;
+  uint64_t last_loop_ms;
+  uint64_t loop_count;
 
 
   // init should be called on first power on if using RTC memory
@@ -204,6 +284,7 @@ struct LoopMonitor {
   }
 };
 
+RTC_NOINIT_ATTR FixedQueue<100, sizeof(TelemetryReading)> telemetry_queue;
 RTC_NOINIT_ATTR LoopMonitor loop_monitor;
 RTC_NOINIT_ATTR uint64_t display_request_millis = 0;
 RTC_NOINIT_ATTR bool user_requested_display_on = true;
@@ -247,13 +328,14 @@ void setup() {
     case ESP_SLEEP_WAKEUP_UNDEFINED:
     default:
       Serial.println("waking from undefined / other");
+      setup_wifi(); // calling this first time will get the network time, so dates start of ok
       loop_monitor.init();
+      telemetry_queue.init();
       user_requested_display_on = true;
       break;
   }
   
   device_id = String(ESP.getEfuseMac(), HEX);
-  Serial.println("setup for device_id: "+ device_id);
   
   battery.init();
 
@@ -270,28 +352,39 @@ void setup() {
 
 
 void upload_data_to_server() {
-      if(WiFi.status() != WL_CONNECTED) {
-        setup_wifi();
+  if(WiFi.status() != WL_CONNECTED) {
+    setup_wifi();
+  }
+  mqtt_client.setServer(mqtt_server_address, 8883);
+  // send to hivemq cloud
+  maintain_mqtt_connection();
+  if(mqtt_client.connected()) {
+    TelemetryReading reading;
+    while(telemetry_queue.peek(&reading)==true) {
+      DynamicJsonDocument doc(1024);
+      doc["timestamp"] = reading.timestamp;
+      doc["battery_mv"] = reading.battery_millivolts;
+      doc["temp_0_f"] = reading.temp_0;
+      doc["temp_1_f"] = reading.temp_1;
+
+      const int payload_max_length = 1024;
+      char payload[payload_max_length];
+      auto payload_length =serializeJson(doc, payload, payload_max_length);
+
+      Serial.printf("Sending %s\n", payload);
+
+      String topic = device_id+"/reading";
+      bool publish_success = mqtt_client.publish(topic.c_str(), payload, payload_length);
+      if (publish_success) {
+        telemetry_queue.dequeue(&reading); // simply remove from queue
+      } else {
+        Serial.println("failed to send to mqtt, aborting");
+        return;
       }
-      mqtt_client.setServer(mqtt_server_address, 8883);
-      // send to hivemq cloud
-      maintain_mqtt_connection();
-      if(mqtt_client.connected()) {
-        String topic = device_id+"/battery_volts";
-        publish_mqtt_value(topic.c_str(), battery.millivolts/1000.0);
+    }
 
-        topic = device_id+"/temp_0";
-        float temp_f_0 = temperature_probe.getTempFByIndex(0);
-        if (temp_f_0 < -100) temp_f_0 = NAN;
-        publish_mqtt_value(topic.c_str(), temp_f_0);
-
-        topic = device_id+"/temp_1";
-        float temp_f_1 = temperature_probe.getTempFByIndex(1);
-        if (temp_f_1 < -100) temp_f_1 = NAN;
-        publish_mqtt_value(topic.c_str(), temp_f_1);
-
-      }
-}
+  }
+};
 
 void wifi_task(void * params) {
   Serial.print("wifi_task: Executing on core ");
@@ -306,28 +399,44 @@ void wifi_task(void * params) {
 
 
 
+// probe returns a large negative number if reading is bad
+// change it to NAN, also limits to 2 decimals
+double fix_temp_reading(float t) {
+
+
+  if(t==DEVICE_DISCONNECTED_F) {
+    return NAN;
+  }
+ // rounds a number to 2 decimal places
+ // example: round(3.14159) -> 3.14
+  return (int)(t * 100 + 0.5) / 100.0;;
+}
+
 void loop() {
-  static Statistics probe_0_statistics;
-  static Statistics probe_1_statistics;
-  static float temp_f_0 = NAN;
-  static float temp_f_1 = NAN;
-  static float mean_temp_f_0 = NAN;
-  static float mean_temp_f_1 = NAN;
+  TelemetryReading reading;
+
   static uint64_t wifi_start_ms = 0;
   
 
   loop_monitor.begin_loop();
+
   battery.read_millivolts();
 
-    // get temperature
-  if(loop_monitor.every_n_ms(1000)) {
-    temperature_probe.setWaitForConversion(true);
-    temperature_probe.requestTemperatures(); // Send the command to get temperatures
-  }
+  // get temperature
+  temperature_probe.setWaitForConversion(true);
+  temperature_probe.requestTemperatures(); // Send the command to get temperatures
 
-  mean_temp_f_0 = temp_f_0 = temperature_probe.getTempFByIndex(0);
-  mean_temp_f_1 = temp_f_1 = temperature_probe.getTempFByIndex(1);
-  Serial.printf("loop ms: %ju battery mv: %d temps: %f, %f\n", loop_monitor.loop_ms, battery.millivolts, temp_f_0, temp_f_1);
+  fill_iso_time_string(reading.timestamp);
+  reading.battery_millivolts = battery.millivolts;
+  reading.temp_0 = fix_temp_reading(temperature_probe.getTempFByIndex(0));
+  reading.temp_1 = fix_temp_reading(temperature_probe.getTempFByIndex(1));
+
+
+  char iso_time[27];
+  fill_iso_time_string(iso_time);
+
+  Serial.printf("%s battery mv: %d temps: %f, %f\n", iso_time, reading.battery_millivolts, reading.temp_0, reading.temp_1);
+  
 
   bool force_display_on = user_requested_display_on && (loop_monitor.loop_ms - display_request_millis  <display_hold_ms);
 
@@ -348,25 +457,24 @@ void loop() {
     }
   }
 
-
   if(display_is_on) {
     display.clear();
     battery.draw_battery(display);
     char buff[80];
     display.setFont(ArialMT_Plain_24);
-    if(isnan(mean_temp_f_0)) {
+    if(isnan(reading.temp_0)) {
       sprintf(buff, "--");
     }
     else {
-      sprintf(buff, "%.1f", mean_temp_f_0);
+      sprintf(buff, "%.1f", reading.temp_0);
     }
 
     display.drawString(0, 0, buff);
-    if(isnan(mean_temp_f_1)) {
+    if(isnan(reading.temp_1)) {
       sprintf(buff, "--");
     }
     else {
-      sprintf(buff, "%.1f", mean_temp_f_1);
+      sprintf(buff, "%.1f", reading.temp_1);
     }
     display.drawString(0, 24, buff);
     float graph_min = 65;
@@ -375,11 +483,8 @@ void loop() {
     const int oled_height = 64;
     const int graph_y = 52;
 
-    display.drawRect(0,graph_y + 1, oled_width * (temp_f_0 - graph_min) / (graph_max-graph_min),1);
-    display.drawRect(0,graph_y, oled_width * (mean_temp_f_0 - graph_min) / (graph_max-graph_min),3);
-
-    display.drawRect(0, graph_y+6, oled_width * (temp_f_1 - graph_min) / (graph_max-graph_min),1);
-    display.drawRect(0, graph_y+5, oled_width * (mean_temp_f_1 - graph_min) / (graph_max-graph_min),3);
+    display.drawRect(0,graph_y, oled_width * (reading.temp_0 - graph_min) / (graph_max-graph_min),3);
+    display.drawRect(0, graph_y+5, oled_width * (reading.temp_1 - graph_min) / (graph_max-graph_min),3);
 
     display.display();
   }
@@ -393,12 +498,20 @@ void loop() {
 
   }
 
+  // enqueue
   if(loop_monitor.every_n_ms(5 * 60 * 1000)) {
+    auto queue_rv = telemetry_queue.enqueue(&reading);
+    if(queue_rv != true) {
+      Serial.println("Error sending to queue, full?");
+    }
+  }
+
+  if(loop_monitor.every_n_ms(30  * 60 * 1000)) {
     const char * task_name = "wifi_task";
     const uint32_t stack_depth = 10000; // 1000 caused stack overflow
     void * parameters = nullptr;
     u32_t priority = 1; // lower numbers are lower priority
-    BaseType_t core_id = 0;
+    BaseType_t core_id = 1;
 
     auto rv = xTaskCreatePinnedToCore(
       wifi_task,
@@ -423,7 +536,7 @@ void loop() {
   bool can_deep_sleep =  can_light_sleep  
                          && !display_is_on;
   if(can_deep_sleep) {
-      const uint32_t sleep_seconds = 10;
+      const uint32_t sleep_seconds = 5 * 60;
 
       detachInterrupt(pin_user_button);
       esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, LOW);
