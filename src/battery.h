@@ -1,4 +1,4 @@
-// battery interface for Heltec ESP32 WiFi Kit V3
+// battery support for Heltec ESP32 WiFi Kit V3
 
 #include <Arduino.h>
 

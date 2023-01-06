@@ -1,32 +1,10 @@
-#include <Arduino.h>
-
-
-
-#include <ArduinoJson.h>
-#include <chrono>
-
-
-int64_t get_system_millis() {
-  auto duration = std::chrono::system_clock::now().time_since_epoch();
-  auto chrono_millis = std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
-  return chrono_millis;
-}
-
-void fill_iso_time_string(char * utc_with_ms) {
-  auto now = std::chrono::system_clock::now();
-  time_t tt = std::chrono::system_clock::to_time_t(now);
-
-  char utc[20];
-  strftime(utc, sizeof(utc), "%Y-%m-%dT%H:%M:%S", gmtime(&tt));
-  auto truncated = std::chrono::system_clock::from_time_t(tt);
-  int delta_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - truncated).count();
-  sprintf(utc_with_ms, "%s.%03dZ", utc, delta_ms);
-}
-
 // targets Helteck Wifi Kit 32 V3 
 // https://heltec.org/project/wifi-kit-32-v3/
-// Schematic: https://resource.heltec.cn/download/WiFi_Kit_32_V3/HTIT-WB32_V3_Schematic_Diagram.pdf
+// schematic: https://resource.heltec.cn/download/WiFi_Kit_32_V3/HTIT-WB32_V3_Schematic_Diagram.pdf
 
+#include <Arduino.h>
+#include <ArduinoJson.h>
+#include <chrono>
 
 // for the OLED Display
 #include "SSD1306Wire.h"
@@ -34,7 +12,6 @@ void fill_iso_time_string(char * utc_with_ms) {
 // for the DS18B20 Temperature Sensor
 #include <OneWire.h>
 #include <DallasTemperature.h>
-
 
 // MQTT stuff, tutorial at
 // https://randomnerdtutorials.com/esp32-mqtt-publish-subscribe-arduino-ide/
@@ -45,25 +22,109 @@ void fill_iso_time_string(char * utc_with_ms) {
 #include <PubSubClient.h>
 
 #include "battery.h"
+#include "fixed_queue.h"
 
+// tuneable constants
+const uint32_t vbat_mv_plugged = 4050;
+const uint32_t vbat_mv_unplugged = 3999;
+const uint32_t loop_interval_ms = 1000;
+const uint32_t data_sample_interval_ms = 5 * 60 * 1000; // 5 minute sample time
+const uint32_t display_hold_ms = 60*1000; // time to keep display on while on battery power
+
+ // exactly enough space for iso-time
+const int iso_time_buffer_length = 25;
+
+// types
+struct TelemetryReading {
+  char timestamp[iso_time_buffer_length];
+  double temp_0 = NAN;
+  double temp_1 = NAN;
+  uint16_t battery_millivolts = 0;
+};
+
+bool every_n_ms(int64_t last_loop_ms, int64_t loop_ms, int64_t ms) {
+  return last_loop_ms == 0 || (last_loop_ms % ms) + (loop_ms - last_loop_ms) >= ms;
+}
+
+int64_t get_system_millis() {
+  auto duration = std::chrono::system_clock::now().time_since_epoch();
+  auto chrono_millis = std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
+  return chrono_millis;
+}
+
+struct LoopMonitor {
+  uint64_t loop_ms;
+  uint64_t last_loop_ms;
+  uint64_t loop_count;
+
+  // init should be called on first power on if using RTC memory
+  void init() {
+    loop_ms = 0;
+    last_loop_ms = 0;
+    loop_count = 0;
+  }
+
+  void begin_loop() {
+    last_loop_ms = loop_ms;
+    
+    loop_ms = get_system_millis();
+    ++loop_count;
+  }
+
+  bool every_n_ms(uint64_t interval_ms) {
+    return ::every_n_ms(last_loop_ms, loop_ms, interval_ms);
+  }
+
+  uint64_t ms_elapsed_since_ms(uint64_t ms) {
+    return loop_ms - ms;
+  }
+};
+
+// global variables
 WiFiClientSecure wifi_client;
 PubSubClient mqtt_client(wifi_client);
 
 Battery battery;
 
+// user input button
+const int pin_user_button = 0;
 
-void print_local_time()
-{
-  char buf[27];
-  fill_iso_time_string(buf);
-  Serial.println(buf);
-  return;
-  struct tm timeinfo;
-  if(!getLocalTime(&timeinfo)){
-    Serial.println("Failed to obtain time");
-    return;
-  }
-  Serial.println(&timeinfo, "%A, %B %d %Y %H:%M:%S");
+// oled display
+const int oled_address=0x3c;
+const int pin_oled_sda = 17;
+const int pin_oled_scl = 18;
+const int pin_oled_rst = 21;
+
+// board LED
+const int pin_led = 35;
+
+// temperature sensor pin
+const int pin_one_wire_bus = 26;
+OneWire one_wire(pin_one_wire_bus);
+DallasTemperature temperature_probe(&one_wire);
+
+SSD1306Wire display(oled_address, pin_oled_sda, pin_oled_scl);
+
+String device_id;
+
+bool display_is_on = false;
+TaskHandle_t wifi_task_handle = nullptr;
+
+// variables that outlive deep sleep are declared RTC_NO_INIT_ATTR
+RTC_NOINIT_ATTR FixedQueue<100, sizeof(TelemetryReading)> telemetry_queue;
+RTC_NOINIT_ATTR LoopMonitor loop_monitor;
+RTC_NOINIT_ATTR uint64_t display_request_millis = 0;
+RTC_NOINIT_ATTR bool user_requested_display_on = true;
+
+void fill_iso_time_string(char * utc_with_ms) {
+  auto now = std::chrono::system_clock::now();
+  time_t tt = std::chrono::system_clock::to_time_t(now);
+
+  char utc[20];
+  strftime(utc, sizeof(utc), "%Y-%m-%dT%H:%M:%S", gmtime(&tt));
+  auto truncated = std::chrono::system_clock::from_time_t(tt);
+  int delta_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - truncated).count();
+  sprintf(utc_with_ms, "%s.%03dZ", utc, delta_ms);
 }
 
 void setup_wifi() {
@@ -88,32 +149,13 @@ void setup_wifi() {
   }
 
   Serial.println("");
-  Serial.println("WiFi connected");
-  Serial.println("IP address: ");
+  Serial.print("WiFi connected, IP address ");
   Serial.println(WiFi.localIP());
 
   wifi_client.setCACert(root_ca);
 }
 
 
-// user input button
-const int pin_user_button = 0;
-
-// oled display
-const int oled_address=0x3c;
-const int pin_oled_sda = 17;
-const int pin_oled_scl = 18;
-const int pin_oled_rst = 21;
-
-// board LED
-const int pin_led = 35;
-
-// temperature sensor pin
-const int pin_one_wire_bus = 26;
-OneWire one_wire(pin_one_wire_bus);
-DallasTemperature temperature_probe(&one_wire);
-
-SSD1306Wire display(oled_address, pin_oled_sda, pin_oled_scl);
 
 void init_display() {
   // prepare oled display
@@ -124,15 +166,6 @@ void init_display() {
   delay(100);
   display.init();
 }
-
-
-struct TelemetryReading {
-  char timestamp[25]; // exactly enought space for iso-time
-  double temp_0 = NAN;
-  double temp_1 = NAN;
-  uint16_t battery_millivolts = 0;
-};
-
 
 void scan_i2c_addresses(){
   Serial.println("\n Scanning I2C Addresses");
@@ -154,142 +187,18 @@ void scan_i2c_addresses(){
   Serial.println(" devices");
 }
 
-
 void maintain_mqtt_connection() {
-  if(!mqtt_client.connected()) {
-    if(mqtt_client.connect("tank1", mqtt_username, mqtt_password)) {
-      Serial.println("connected to mqtt with username and password");
-    } else {
-      Serial.println("failed to connect to mqtt with username and password");
-    }
+  if(mqtt_client.connected()) {
+    return;
   }
-
+  bool success = mqtt_client.connect(device_id.c_str(), mqtt_username, mqtt_password);
+  if(success) {
+    Serial.println("connected to mqtt with username and password");
+  } else {
+    Serial.println("failed to connect to mqtt with username and password");
+  }
 }
 
-String device_id;
-
-
-bool every_n_ms(int64_t last_loop_ms, int64_t loop_ms, int64_t ms) {
-  return last_loop_ms == 0 || (last_loop_ms % ms) + (loop_ms - last_loop_ms) >= ms;
-}
-
-class Statistics {
-  public:
-      int count = 0;
-      float sum_x = 0.0;
-      float sum_x2 = 0.0;
-
-    void reset() {
-      count = 0;
-      sum_x = 0.0;
-      sum_x2 = 0.0;
-    }
-
-    void add_reading(float x) {
-      count += 1;
-      sum_x += x;
-      sum_x2 += x*x;
-    }
-
-    float mean() {
-      return sum_x / count;
-    }
-};
-
-
-template  <uint32_t n, uint32_t item_size> class FixedQueue {
-public:
-  byte array[n][item_size];
-  int front;
-  int rear;
-  void init() {
-    front = -1;
-    rear = -1;
-  }
-
-  // returns true on success
-  bool enqueue(void * item) {
-      if ((front == 0 && rear == n-1) || (front == rear+1)) {
-          // overflow
-          return false;
-      }
-      if (front == -1) {
-          front = 0;
-          rear = 0;
-      } else {
-          rear = (rear == n - 1) ? 0 :  rear + 1;
-      }
-      memcpy(array[rear], item, item_size);
-      return true;
-  }
-
-  bool peek(void * item) {
-    if (front == -1) {
-      // underflow
-      return false;
-    }
-    memcpy(item, array[front],item_size);
-    return true;
-  }
-
-  bool dequeue(void * item) {
-    if (front == -1) {
-      // underflow
-      return false;
-    }
-    memcpy(item, array[front],item_size);
-
-    if (front == rear) {
-      front = -1;
-      rear = -1;
-    } else {
-      front = (front == n - 1) ? 0: front + 1;
-    }
-  return true;
-  }
-};
-
-
-const uint32_t vbat_mv_plugged = 4050;
-const uint32_t vbat_mv_unplugged = 3999;
-const uint32_t loop_interval_ms = 1000;
-const uint32_t data_sample_interval_ms = 5 * 60 * 1000; // 5 minute sample time
-const uint32_t display_hold_ms = 60*1000; // time to keep display on while on battery power
-
-struct LoopMonitor {
-  uint64_t loop_ms;
-  uint64_t last_loop_ms;
-  uint64_t loop_count;
-
-
-  // init should be called on first power on if using RTC memory
-  void init() {
-    loop_ms = 0;
-    last_loop_ms = 0;
-    loop_count = 0;
-  }
-
-  void begin_loop() {
-    last_loop_ms = loop_ms;
-    
-    loop_ms = get_system_millis();
-    ++loop_count;
-  }
-  bool every_n_ms(uint64_t interval_ms) {
-    return ::every_n_ms(last_loop_ms, loop_ms, interval_ms);
-  }
-
-  uint64_t ms_elapsed_since_ms(uint64_t ms) {
-    return loop_ms - ms;
-  }
-};
-
-RTC_NOINIT_ATTR FixedQueue<100, sizeof(TelemetryReading)> telemetry_queue;
-RTC_NOINIT_ATTR LoopMonitor loop_monitor;
-RTC_NOINIT_ATTR uint64_t display_request_millis = 0;
-RTC_NOINIT_ATTR bool user_requested_display_on = true;
-bool display_is_on = false;
-TaskHandle_t wifi_task_handle = nullptr;
 
 void user_button_pressed() {
 
@@ -317,8 +226,6 @@ void setup() {
       user_requested_display_on = true;
       display_request_millis = get_system_millis();
       Serial.println("waking from EXT0");
-      // pinMode(pin_led, OUTPUT);
-      // digitalWrite(pin_led, HIGH);
       break;
 
     case ESP_SLEEP_WAKEUP_TIMER:
@@ -348,8 +255,6 @@ void setup() {
   pinMode(pin_user_button, INPUT);
   attachInterrupt(pin_user_button, user_button_pressed, FALLING);
 }
-
-
 
 void upload_data_to_server() {
   if(WiFi.status() != WL_CONNECTED) {
@@ -397,27 +302,20 @@ void wifi_task(void * params) {
   vTaskDelete(NULL); // delete this task
 }
 
-
-
-// probe returns a large negative number if reading is bad
-// change it to NAN, also limits to 2 decimals
+// change bad reading to NAN, and limit to 2 decimals
 double fix_temp_reading(float t) {
-
-
+  // if reading is bad, probe returns a large negative number
   if(t==DEVICE_DISCONNECTED_F) {
     return NAN;
   }
- // rounds a number to 2 decimal places
- // example: round(3.14159) -> 3.14
+  // round to 2 decimal places
   return (int)(t * 100 + 0.5) / 100.0;;
 }
 
 void loop() {
   TelemetryReading reading;
-
   static uint64_t wifi_start_ms = 0;
   
-
   loop_monitor.begin_loop();
 
   battery.read_millivolts();
@@ -431,16 +329,13 @@ void loop() {
   reading.temp_0 = fix_temp_reading(temperature_probe.getTempFByIndex(0));
   reading.temp_1 = fix_temp_reading(temperature_probe.getTempFByIndex(1));
 
+  char iso_time_string[iso_time_buffer_length];
+  fill_iso_time_string(iso_time_string);
 
-  char iso_time[27];
-  fill_iso_time_string(iso_time);
-
-  Serial.printf("%s battery mv: %d temps: %f, %f\n", iso_time, reading.battery_millivolts, reading.temp_0, reading.temp_1);
-  
+  Serial.printf("%s battery mv: %d temps: %f, %f\n", iso_time_string, reading.battery_millivolts, reading.temp_0, reading.temp_1);
 
   bool force_display_on = user_requested_display_on && (loop_monitor.loop_ms - display_request_millis  <display_hold_ms);
 
-  
   if (display_is_on) {
     // turn off display if unplugged and no user requeste
     if ( user_requested_display_on == false 
@@ -450,7 +345,7 @@ void loop() {
     }
   } else  {
     // turn on display if plugged in or user requested
-      if (force_display_on) {
+    if (force_display_on) {
       init_display();
       display_is_on = true;
       display.displayOn();
@@ -511,7 +406,7 @@ void loop() {
     const uint32_t stack_depth = 10000; // 1000 caused stack overflow
     void * parameters = nullptr;
     u32_t priority = 1; // lower numbers are lower priority
-    BaseType_t core_id = 1;
+    BaseType_t core_id = 1; // core 0 caused watchdog error
 
     auto rv = xTaskCreatePinnedToCore(
       wifi_task,
@@ -552,5 +447,4 @@ void loop() {
       vTaskDelay(delay_ms / portTICK_PERIOD_MS);
     }
   }
- 
 }
