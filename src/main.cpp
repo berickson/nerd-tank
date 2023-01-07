@@ -21,6 +21,8 @@
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
 
+#include "esp_sntp.h"
+
 #include "battery.h"
 #include "fixed_queue.h"
 
@@ -127,6 +129,13 @@ void fill_iso_time_string(char * utc_with_ms) {
   sprintf(utc_with_ms, "%s.%03dZ", utc, delta_ms);
 }
 
+bool time_sync_complete = false;
+void time_sync_callback(struct timeval *tv)
+{
+    time_sync_complete = true;
+    Serial.println("time sync OK");
+}
+
 void setup_wifi() {
   // We start by connecting to a WiFi network
   Serial.println();
@@ -145,7 +154,19 @@ void setup_wifi() {
     long gmt_offset_sec = 0;
     long daylight_offset_sec = 0;
     const char* ntp_server = "pool.ntp.org";
+
+    // callback allows us to know when time sync is complete
+    sntp_set_time_sync_notification_cb(time_sync_callback);
     configTime(gmt_offset_sec, daylight_offset_sec, ntp_server);
+
+    for(int i=0;i<5000;++i) {
+      if(time_sync_complete)
+        break;
+      delay(1);
+    }
+    if(!time_sync_complete) {
+      Serial.println("time sync failed");
+    }
   }
 
   Serial.println("");
